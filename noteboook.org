@@ -1,0 +1,399 @@
+#+title: Classification Model Hardening
+
+* Reference model
+** Parameters
+
+#+begin_src python
+# ---------------------------------All Pipeline parameters
+# not as a running cell just to look at parameters
+## Dataset path
+DATA_DIR = "/kaggle/input/fruits/fruits-360_100x100/fruits-360"
+TRAIN_DIR = os.path.join(DATA_DIR, "Training")
+TEST_DIR = os.path.join(DATA_DIR, "Test")
+
+## Image parameters
+IMG_SIZE = (224, 224)
+CHANNELS = 3
+IMG_SHAPE = (IMG_SIZE[0], IMG_SIZE[1], CHANNELS)
+
+## Training parameters
+BATCH_SIZE = 32
+EPOCHS = 15 #Initiale go for 50 but time
+LEARNING_RATE = 0.001
+VALIDATION_SPLIT = 0.2
+
+## Modele parameters
+MODEL_NAME = 'EfficientNetB0' # or MobileNet
+WEIGHTS = 'imagenet'
+
+# Saving path
+OUTPUT_DIR = '/kaggle/working/'
+MODEL_SAVE_PATH = os.path.join(OUTPUT_DIR, 'fruit_model.h5')
+WEIGHTS_SAVE_PATH = os.path.join(OUTPUT_DIR, 'fruit_weight.h5')
+CLASSES_PATH = os.path.join(OUTPUT_DIR, 'class_indices.json')
+#+end_src
+
+** Libraries Importations
+
+#+begin_src python
+# System librairies
+import os
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+import pickle
+import json
+import seaborn as sns
+
+# Data process tools
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Deep learning librairies
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import EfficientNetB0
+
+# Ignore warnings
+import warnings
+warnings.filterwarnings('ignore')
+
+print('All modules are well imported and loaded)
+#+end_src
+
+** Dataset Preparation
+*** Loading dataset
+
+#+begin_src python
+# Function to load dataset images 
+def load_dataset_images(DATA_DIR):
+    filepaths = []
+    labels = []
+
+    # Create dataframe with filepaths and labels
+    for class_name in os.listdir(DATA_DIR):
+        class_path = os.path.join(DATA_DIR, class_name)
+        if os.path.isdir(class_path):
+            for img_name in os.listdir(class_path):
+                if img_name.endswith(('.png', '.jpg', '.jpeg')):
+                    filepaths.append(os.path.join(class_path, img_name))
+                    labels.append(class_name)
+
+    df = pd.DataFrame({'filepaths': filepaths, 'labels': labels})
+    return df
+
+# Load datasets
+train_df = load_dataset_images(TRAIN_DIR)
+test_df = load_dataset_images(TEST_DIR)
+
+print(f"Train samples {len(train_df)}")
+print(f"Test samples {len(test_df)}")
+print(f"Classes {train_df['labels'].nunique()}")
+#+end_src
+
+*** Preprocessing
+
+#+begin_src python
+# Split dataset into train and validation
+train_ds, valid_ds = train_test_split(train_df, test_size=0.2, stratify=train_df['labels'], random_state=42)
+test_ds = test_df
+
+print(f"Train {len(train_ds)} | Valid {len(valid_ds)} | Test {len(test_ds)}")
+
+# Custom batch size
+ts_length = len(test_ds)
+test_batch_size = max(sorted([ts_length // n for n in range(1, ts_length + 1) if ts_length % n == 0 and ts_length / n <= 80]))
+test_steps = ts_length // test_batch_size
+
+# Custom function for preprocessing
+def caliber(img):
+    return img / 255.0
+    
+# Generation for training with augmentation
+train_gn = ImageDataGenerator(
+    preprocessing_function=caliber,
+    rotation_range=40,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    brightness_range=[0.4, 0.6],
+    zoom_range=0.3,
+    horizontal_flip=True,
+    vertical_flip=True
+)
+# Generation for testing/validation without augmentation
+test_gn = ImageDataGenerator(
+    preprocessing_function=caliber
+)
+
+# Create generator
+# For training data
+train_gen = train_gn.flow_from_dataframe(
+    train_ds,
+    x_col='filepaths',
+    y_col='labels',
+    target_size=IMG_SIZE,
+    class_mode='categorical',
+    color_mode='rgb',
+    shuffle=True,
+    batch_size=BATCH_SIZE
+)
+
+# For validation data
+valid_gen = test_gn.flow_from_dataframe(
+    valid_ds,
+    x_col='filepaths',
+    y_col='labels',
+    target_size=IMG_SIZE,
+    class_mode='categorical',
+    color_mode='rgb',
+    shuffle=True,
+    batch_size=BATCH_SIZE
+)
+   
+# For test data
+test_gen = test_gn.flow_from_dataframe(
+    test_ds,
+    x_col='filepaths',
+    y_col='labels',
+    target_size=IMG_SIZE,
+    class_mode='categorical',
+    color_mode='rgb',
+    shuffle=False,
+    batch_size=BATCH_SIZE
+)
+
+print(f"Generatots created with success")
+print(f"Number classes {train_gen.class_indices}")
+#+end_src
+
+*** Visualisation
+
+#+begin_src python
+# Visualize a random data samples
+g_dict = train_gen.class_indices
+classes = list(g_dict.keys())
+images, labels = next(train_gen)
+
+plt.figure(figsize=(20, 8))
+for i in range(10):
+    plt.subplot(2, 5, i + 1)
+    plt.imshow(images[i])
+    label_idx = np.argmax(labels[i])
+    class_name = classes[label_idx]
+    plt.title(class_name)
+    plt.axis('off')
+plt.tight_layout()
+plt.show()
+#+end_src
+
+** Modele Construction
+
+#+begin_src python
+# We using Efficient Net model on this cell
+EfficientNetB0_model = tf.keras.applications.EfficientNetB0(
+    include_top=False,
+    weights="imagenet",
+    input_shape=IMG_SHAPE,
+    pooling='max'
+)
+
+EfficientNetB0_model.trainable = True
+
+# Building model
+num_classes = len(train_gen.class_indices)
+
+model = Sequential([
+    EfficientNetB0_model,
+    Dense(132, activation='relu'),
+    Dense(64, activation='relu'),
+    Dense(num_classes, activation='softmax')
+])
+
+model.summary()
+#+end_src
+
+** Initial Training (safe)
+
+#+begin_src python
+# Compile the model
+adam = keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+model.compile(
+    loss='categorical_crossentropy',
+    optimizer=adam,
+    metrics=['accuracy']
+)
+print("Model compile successfully")
+
+# Train the model
+history = model.fit(
+    train_gen,
+    validation_data=valid_gen,
+    epochs=EPOCHS,
+    verbose=1
+)
+print("Training end")
+#+end_src
+
+** Evaluation
+*** Performance Evaluation
+
+#+begin_src python
+# Evaluate model performance
+train_score = model.evaluate(train_gen, steps=test_steps, verbose=1)
+valid_score = model.evaluate(valid_gen, steps=test_steps, verbose=1)
+test_score = model.evaluate(test_gen, steps=test_steps, verbose=1)
+
+print(f"Train Loss {train_score[0]:.4f}")
+print(f"Train Accuracy {train_score[1]:.4f}")
+print()
+print(f"Validation Loss {valid_score[0]:.4f}")
+print(f"Validation Accuracy {valid_score[1]:.4f}")
+print()
+print(f"Test Loss {test_score[0]:.4f}")
+print(f"Test Accuracy {test_score[1]:.4f}")
+#+end_src
+
+*** Plot training
+
+#+begin_src python
+# Plot training history
+plt.figure(figsize=(14, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Train Acc')
+plt.plot(history.history['val_accuracy'], label='Val Acc')
+plt.title('Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+#+end_src
+
+*** Confusion matrix (metrics)
+
+#+begin_src python
+# Confusion matrix
+test_gen.reset()
+y_pred = model.predict(test_gen, steps=test_steps, verbose=1)
+y_pred_classes = np.argmax(y_pred, axis=1)
+y_true = test_gen.classes[:len(y_pred_classes)]
+
+cm = confusion_matrix(y_true, y_pred_classes)
+
+if len(classes) <= 20:
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.show()
+else:
+    print(f"Too many classes ({len(classes)}) to display confusion matrix")
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred_classes, target_names=classes))
+#+end_src
+
+** Model test
+*** Load & Image Preprocessing
+
+#+begin_src python
+# Function to load and preprocess image
+def load_img(image_path, show=True):
+    img = Image.open(image_path).resize(img_size)
+    img_array = np.array(img) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
+    
+    if show:
+        plt.figure(figsize=(6, 6))
+        plt.imshow(img)
+        plt.title(os.path.basename(image_path))
+        plt.axis('off')
+        plt.show()
+    
+    return img_array
+
+# Function to get label and probabilities
+def get_label_probabilities(pred):
+    pred_idx = np.argmax(pred[0])
+    label = classes[pred_idx]
+    probability = pred[0][pred_idx]
+    
+    # Top 5 predictions
+    top5_idx = np.argsort(pred[0])[-5:][::-1]
+    top5 = [(classes[i], pred[0][i]) for i in top5_idx]
+    
+    return label, probability, top5
+#+end_src
+
+*** Prediction
+
+#+begin_src python
+# Test on a random image from test set
+random_idx = np.random.randint(len(test_ds))
+image_path = test_ds.iloc[random_idx]['filepaths']
+true_label = test_ds.iloc[random_idx]['labels']
+
+print(f"Testing on: {os.path.basename(image_path)}")
+print(f"True label: {true_label}")
+
+new_image = load_img(image_path, show=True)
+prediction = model.predict(new_image, verbose=0)
+label, probability, top5 = get_label_probabilities(prediction)
+
+print(f"\nPredicted: {label}")
+print(f"Confidence: {probability*100:.2f}%")
+print(f"Correct: {label == true_label}")
+print(f"\nTop 5 predictions:")
+for i, (cls, prob) in enumerate(top5, 1):
+    print(f"{i}. {cls}: {prob*100:.2f}%")
+#+end_src
+
+** Save model
+
+#+begin_src python
+# Function to save model
+def save_model(model, OUTPUT_DIR):
+    # Save complete model
+    model.save(MODEL_SAVE_PATH)
+    print(f"Model saved: {MODEL_SAVE_PATH}")
+    
+    # Save weights only
+    model.save_weights(WEIGHTS_SAVE_PATH)
+    print(f"Weights saved: {WEIGHTS_SAVE_PATH}")
+    
+    # Save training history might be useful later
+    history_path = os.path.join(OUTPUT_DIR, 'training_history.pkl')
+    with open(history_path, 'wb') as f:
+        pickle.dump(history.history, f)
+    print(f"History saved: {history_path}")
+    
+    # Save class indices
+    with open(CLASSES_PATH, 'w') as f:
+        json.dump(g_dict, f, indent=4)
+    print(f"Classes saved: {CLASSES_PATH}")
+
+# Execute save
+save_model(model)
+#+end_src
+
+* Model Attacked
+* Hardening
+* Conclusion
