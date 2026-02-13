@@ -1,0 +1,14 @@
+@echo off
+echo.
+echo   vegclassify — lancement (CPU)
+echo.
+
+cd /d "%~dp0"
+
+if not exist "backend\static\index.html" (
+    echo [!] Frontend pas encore build. Lance: cd frontend ^&^& npm ci ^&^& npm run build
+    echo.
+)
+
+python backend\server.py --baseline models\baseline_model.pth --hardened models\hardened_model.pth --port 8080
+pause

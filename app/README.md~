@@ -1,0 +1,131 @@
+# 🥦 vegclassify — Déploiement CPU
+
+Application de classification de légumes pour PC sans GPU.  
+**Python backend** (FastAPI + PyTorch CPU) · **React frontend** · Charge les `.pth` directement.
+
+## Prérequis
+
+| Outil | Version |
+|-------|---------|
+| Python | ≥ 3.10 |
+| Node.js | ≥ 18 (pour build le frontend) |
+
+## Installation
+
+### 1. Cloner et installer les dépendances Python
+
+```bash
+cd vegclassify
+pip install -r backend/requirements.txt
+```
+
+> Sur certains systèmes : `pip install -r backend/requirements.txt --break-system-packages`
+>
+> PyTorch CPU s'installe automatiquement. Si tu veux la version CPU-only plus légère :
+> ```bash
+> pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+> pip install fastapi uvicorn[standard] python-multipart Pillow
+> ```
+
+### 2. Placer les modèles
+
+```
+vegclassify/
+└── models/
+    ├── baseline_model.pth    ← Phase A (du pipeline Kaggle)
+    └── hardened_model.pth    ← Phase C (du pipeline Kaggle)
+```
+
+### 3. Build le frontend (une seule fois)
+
+```bash
+cd frontend
+npm ci
+npm run build
+cd ..
+```
+
+Le build produit les fichiers dans `backend/static/`.
+
+### 4. Lancer
+
+```bash
+# Linux / Mac
+./run.sh
+
+# Windows
+run.bat
+
+# Ou directement
+python backend/server.py \
+    --baseline models/baseline_model.pth \
+    --hardened models/hardened_model.pth \
+    --port 8080
+```
+
+→ Ouvrir **http://localhost:8080**
+
+## Usage
+
+L'interface permet de :
+- **Charger une image** de légume (drag & drop ou clic)
+- **Choisir le modèle** : Base (Phase A), Durci (Phase C), ou Comparer les deux
+- **Voir les résultats** : top-5 prédictions avec confiance, temps d'inférence
+
+En mode **Comparer**, la même image passe dans les deux modèles côte à côte.
+
+## Structure
+
+```
+vegclassify/
+├── backend/
+│   ├── server.py              FastAPI + PyTorch CPU inference
+│   └── requirements.txt       Dépendances Python
+│
+├── frontend/
+│   └── src/
+│       ├── components/        8 composants React
+│       ├── hooks/             State management
+│       ├── types/             TypeScript interfaces
+│       └── utils/             API client + constantes
+│
+├── models/                    .pth du pipeline Kaggle
+├── run.sh                     Lanceur Linux/Mac
+├── run.bat                    Lanceur Windows
+└── README.md
+```
+
+## API
+
+| Endpoint | Méthode | Description |
+|----------|---------|-------------|
+| `/api/health` | GET | Status, device, modèles chargés |
+| `/api/models` | GET | Liste des clés de modèles |
+| `/api/classes` | GET | 15 classes de légumes |
+| `/api/predict` | POST | Inférence un modèle (`file` + `model`) |
+| `/api/compare` | POST | Inférence les deux modèles (`file`) |
+
+## Options CLI
+
+```
+python backend/server.py [options]
+
+  --baseline PATH    Modèle de base .pth (Phase A)
+  --hardened PATH    Modèle durci .pth (Phase C)
+  --port PORT        Port du serveur (défaut: 8080)
+  --host HOST        Adresse d'écoute (défaut: 127.0.0.1)
+```
+
+## Développement
+
+```bash
+# Terminal 1 : backend (recharge manuelle)
+python backend/server.py --baseline models/baseline_model.pth --hardened models/hardened_model.pth
+
+# Terminal 2 : frontend hot reload (port 3000, proxy → 8080)
+cd frontend && npm run dev
+```
+
+## Performance CPU
+
+L'inférence EfficientNet-B0 en PyTorch CPU prend typiquement **50-150ms** par image selon le processeur. C'est suffisant pour un usage interactif.
