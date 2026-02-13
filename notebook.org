@@ -353,7 +353,8 @@ plt.setp(ax.get_xticklabels(), rotation=45, ha='right'); plt.tight_layout()
 plt.show()
 plt.savefig(os.path.join(OUTPUT_DIR, "A_confusion_matrix.png"), dpi=150, bbox_inches='tight')
 #+end_src
-
+[[file:assets/A_training_curves.png]]
+[[file:assets/A_confusion_matrix.png]]
 
 * Adversarial Attacks
 ** Attacks 
@@ -411,7 +412,7 @@ for pf in POISON_FRACS:
     del p_model; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 #+end_src
 
-** Visualization
+** Visualization (adversarial examples data)
 #+begin_src python
 baseline.eval()
 s_imgs, s_lbls = next(iter(test_loader))
@@ -444,6 +445,7 @@ plt.tight_layout()
 plt.show()
 plt.savefig(os.path.join(OUTPUT_DIR, "B_adversarial_examples.png"), dpi=150, bbox_inches='tight')
 #+end_src
+[[file:assets/B_adversarial_examples.png]]
 
 ** Performance Visualization
 #+begin_src python
@@ -475,6 +477,7 @@ plt.tight_layout()
 plt.show()
 plt.savefig(os.path.join(OUTPUT_DIR, "B_attack_impact.png"), dpi=150, bbox_inches='tight')
 #+end_src
+[[file:assets/B_attack_impact.png]]
 
 * Hardening
 ** Adversarial PGD Training
@@ -618,6 +621,7 @@ plt.tight_layout()
 plt.show()
 plt.savefig(os.path.join(OUTPUT_DIR, "C_robustness_comparison.png"), dpi=150, bbox_inches='tight')
 #+end_src
+[[file:assets/C_robustness_comparison.png]]
 
 ** Prediction Test
 #+begin_src python
@@ -653,3 +657,4 @@ plt.tight_layout()
 plt.show()
 plt.savefig(os.path.join(OUTPUT_DIR, "C_training_curves.png"), dpi=150, bbox_inches='tight')
 #+end_src
+[[file:assets/C_training_curves.png]]

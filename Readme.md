@@ -32,9 +32,9 @@ This project aims to:
    - Training with active defense mechanisms
    - Comparison of performance and robustness
 7. **Deployment and Final Testing**
-  - Model export in ONNX and h5 formats
-  - Inference in a C++ application
-  - Robustness testing under real-world conditions
+   - Model export in ONNX and h5 formats
+   - Inference in a C++ application
+   - Robustness testing under real-world conditions
 
 ---
 
@@ -59,10 +59,11 @@ This project aims to:
   - **PGD**: iterative projected gradient-based attack
   
 ### Defenses (To be implemented)
+  - **PGD Adversarial Training**
 
 ---
 
 ## Results
 
 Model performance is compared across the different stages of the project
-(visualizations and detailed results coming soon)
+(visualizations and detailed results can be found on /assets or notebook.org for more details)
