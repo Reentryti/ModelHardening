@@ -51,7 +51,7 @@ This project aims to:
 
 ---
 
-## Attaques et défenses
+## Attack & Defense
 
 ### Attaques
   - **Data poisoning**: targeted corruption of training data
@@ -62,7 +62,7 @@ This project aims to:
 
 ---
 
-## Résultats
+## Results
 
 Model performance is compared across the different stages of the project
-(visualizations and detailed results coming soon)Les performances du modele sont comparees aux différentes etapes du projet
+(visualizations and detailed results coming soon)
