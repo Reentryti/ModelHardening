@@ -1,0 +1,511 @@
+#+title: Classification Model Hardening
+
+** Importations
+** Parameters
+** Functions
+* Standard Model
+** Dataset Preparation
+#+begin_src python
+normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+train_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+    transforms.ToTensor(),
+    normalize,
+])
+
+eval_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    normalize,
+])
+
+train_dataset = ImageFolder(os.path.join(DATA_DIR, "train"), transform=train_transform)
+val_dataset   = ImageFolder(os.path.join(DATA_DIR, "validation"), transform=eval_transform)
+test_dataset  = ImageFolder(os.path.join(DATA_DIR, "test"), transform=eval_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True)
+val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+CLASS_NAMES = train_dataset.classes
+NUM_CLASSES = len(CLASS_NAMES)
+
+print(f"Classes ({NUM_CLASSES}): {CLASS_NAMES}")
+print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
+#+end_src
+
+** Modele Construction
+
+#+begin_src python
+baseline = build_model()
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+hist_A = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+best_val_acc_A = 0.0
+#+end_src
+
+** Training
+*** Initial Training
+#+begin_src python
+for p in baseline.features.parameters(): p.requires_grad = False
+
+opt = optim.Adam(filter(lambda p: p.requires_grad, baseline.parameters()), lr=LR_FROZEN, weight_decay=WEIGHT_DECAY)
+sched = optim.lr_scheduler.StepLR(opt, step_size=5, gamma=0.5)
+P1 = EPOCHS_BASELINE // 2
+
+for epoch in range(1, P1 + 1):
+    baseline.train()
+    rloss, correct, total = 0.0, 0, 0
+    for imgs, lbls in train_loader:
+        imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
+        opt.zero_grad()
+        out = baseline(imgs); loss = criterion(out, lbls)
+        loss.backward(); opt.step()
+        rloss += loss.item() * imgs.size(0)
+        correct += out.argmax(1).eq(lbls).sum().item(); total += lbls.size(0)
+    sched.step()
+    tl, ta = rloss/total, 100.*correct/total
+
+    res = evaluate_clean(baseline, val_loader)
+    vl, va = res["loss"], res["accuracy"]
+    hist_A["train_loss"].append(tl); hist_A["train_acc"].append(ta)
+    hist_A["val_loss"].append(vl);   hist_A["val_acc"].append(va)
+
+    print(f"  Epoch [{epoch}/{P1}] Train: {tl:.4f}/{ta:.2f}% | Val: {vl:.4f}/{va:.2f}%")
+    if va > best_val_acc_A:
+        best_val_acc_A = va
+        torch.save(baseline.state_dict(), os.path.join(OUTPUT_DIR, "_best_A.pth"))
+#+end_src
+
+*** Fine Tuning
+#+begin_src python
+for p in baseline.features.parameters(): p.requires_grad = True
+
+opt = optim.Adam(baseline.parameters(), lr=LR_FINETUNE, weight_decay=WEIGHT_DECAY)
+P2 = EPOCHS_BASELINE - P1
+sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=P2)
+
+for epoch in range(1, P2 + 1):
+    t0 = time.time()
+    baseline.train()
+    rloss, correct, total = 0.0, 0, 0
+    for imgs, lbls in train_loader:
+        imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
+        opt.zero_grad()
+        out = baseline(imgs); loss = criterion(out, lbls)
+        loss.backward(); opt.step()
+        rloss += loss.item() * imgs.size(0)
+        correct += out.argmax(1).eq(lbls).sum().item(); total += lbls.size(0)
+    sched.step()
+    tl, ta = rloss/total, 100.*correct/total
+
+    res = evaluate_clean(baseline, val_loader)
+    vl, va = res["loss"], res["accuracy"]
+    hist_A["train_loss"].append(tl); hist_A["train_acc"].append(ta)
+    hist_A["val_loss"].append(vl);   hist_A["val_acc"].append(va)
+
+    print(f"  Epoch [{epoch}/{P2}] Train: {tl:.4f}/{ta:.2f}% | Val: {vl:.4f}/{va:.2f}% | {time.time()-t0:.1f}s")
+    if va > best_val_acc_A:
+        best_val_acc_A = va
+        torch.save(baseline.state_dict(), os.path.join(OUTPUT_DIR, "_best_A.pth"))
+
+baseline.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "_best_A.pth"), weights_only=True))
+#+end_src
+
+** Evaluation
+
+#+begin_src python
+
+print(f"\n Évaluation sur le test set")
+res_A = evaluate_clean(baseline, test_loader)
+
+print(f"  Accuracy:  {res_A['accuracy']:.2f}%")
+print(f"  Precision: {res_A['precision']:.4f}")
+print(f"  Recall:    {res_A['recall']:.4f}")
+print(f"  F1-Score:  {res_A['f1']:.4f}")
+print(f"\n{classification_report(res_A['labels'], res_A['preds'], target_names=CLASS_NAMES)}")
+#+end_src
+
+** Model Save
+
+#+begin_src python
+save_A = os.path.join(OUTPUT_DIR, "baseline_model.pth")
+torch.save({
+    "model_state_dict": baseline.state_dict(),
+    "architecture": "efficientnet_b0",
+    "num_classes": NUM_CLASSES,
+    "class_names": CLASS_NAMES,
+    "best_val_acc": best_val_acc_A,
+    "test_acc": res_A["accuracy"],
+    "test_f1": res_A["f1"],
+    "training": "standard",
+}, save_A)
+print(f"\n Modèle de base sauvegardé: {save_A}")
+#+end_src
+
+** Prediction
+
+#+begin_src python
+my_paths = sorted([p for p in glob.glob(os.path.join(MY_IMAGES_DIR, "**/*.*"), recursive=True)
+                   if p.lower().endswith(('.jpg','.jpeg','.png','.webp'))])
+
+if len(my_paths) == 0:
+    print(" Aucune image trouvée dans MY_IMAGES_DIR")
+else:
+    baseline.eval()
+    ncols = min(len(my_paths), 5)
+    nrows = max(1, (len(my_paths) + ncols - 1) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 5*nrows))
+    axes = np.array(axes).flatten()
+
+    print(f"\n{'#':<4} {'Fichier':<30} {'Prédiction':<20} {'Confiance':>10}")
+    print("─" * 68)
+    for i, path in enumerate(my_paths):
+        tensor = eval_transform(Image.open(path).convert("RGB")).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            probs = F.softmax(baseline(tensor), dim=1)[0]
+            conf, idx = probs.max(0)
+        name = CLASS_NAMES[idx]; c = conf.item()*100
+        print(f" {i+1:<3} {os.path.basename(path):<30} {name:<20} {c:>9.2f}%")
+        axes[i].imshow(denorm(tensor)); axes[i].axis('off')
+        axes[i].set_title(f"{name} ({c:.1f}%)", fontsize=10, fontweight='bold',
+                          color='green' if c > 70 else 'orange')
+    for j in range(len(my_paths), len(axes)): axes[j].axis('off')
+    fig.suptitle("Phase A — Prédictions modèle de base", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+    plt.savefig(os.path.join(OUTPUT_DIR, "A_predictions.png"), dpi=150, bbox_inches='tight')
+#+end_src
+
+** Performance Visualization
+
+#+begin_src python
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("Phase A — Courbes d'entraînement (modèle de base)", fontsize=14, fontweight='bold')
+ep = range(1, len(hist_A["train_loss"])+1)
+axes[0].plot(ep, hist_A["train_loss"], 'o-', color='#3b82f6', label='Train', ms=4)
+axes[0].plot(ep, hist_A["val_loss"], 's-', color='#ef4444', label='Val', ms=4)
+axes[0].axvline(x=P1, color='gray', ls='--', alpha=0.5); axes[0].legend(); axes[0].grid(alpha=0.3)
+axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss"); axes[0].set_title("Loss")
+axes[1].plot(ep, hist_A["train_acc"], 'o-', color='#3b82f6', label='Train', ms=4)
+axes[1].plot(ep, hist_A["val_acc"], 's-', color='#ef4444', label='Val', ms=4)
+axes[1].axvline(x=P1, color='gray', ls='--', alpha=0.5); axes[1].legend(); axes[1].grid(alpha=0.3)
+axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Accuracy (%)"); axes[1].set_title("Accuracy")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "A_training_curves.png"), dpi=150, bbox_inches='tight')
+plt.show()
+
+cm_A = confusion_matrix(res_A["labels"], res_A["preds"])
+fig, ax = plt.subplots(figsize=(12, 10))
+sns.heatmap(cm_A.astype('float') / cm_A.sum(axis=1)[:, None], annot=True, fmt='.2f',
+            cmap='Blues', xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
+ax.set_title(f"Phase A — Confusion Matrix (Acc: {res_A['accuracy']:.2f}%)", fontweight='bold')
+ax.set_xlabel("Prédiction"); ax.set_ylabel("Vérité")
+plt.setp(ax.get_xticklabels(), rotation=45, ha='right'); plt.tight_layout()
+plt.show()
+plt.savefig(os.path.join(OUTPUT_DIR, "A_confusion_matrix.png"), dpi=150, bbox_inches='tight')
+#+end_src
+
+
+* Adversarial Attacks
+** Attacks 
+*** FGSM
+#+begin_src python
+print("\n FGSM (Fast Gradient Sign Method)")
+fgsm_results_A = []
+for eps in FGSM_EPSILONS:
+    r = evaluate_attack(baseline, test_loader, lambda m, x, y, e=eps: fgsm_attack(m, x, y, e))
+    drop = res_A["accuracy"] - r["accuracy"]
+    fgsm_results_A.append({"eps": eps, **r, "drop": drop})
+    print(f"  ε={eps:.2f} → Acc: {r['accuracy']:.2f}% (↓{drop:.2f}%) | F1: {r['f1']:.4f}")
+#+end_src
+
+*** PGD
+#+begin_src python
+print("\n PGD (Projected Gradient Descent)")
+pgd_results_A = []
+for eps in PGD_EPSILONS:
+    r = evaluate_attack(baseline, test_loader,
+                        lambda m, x, y, e=eps: pgd_attack(m, x, y, e, PGD_ALPHA, PGD_STEPS))
+    drop = res_A["accuracy"] - r["accuracy"]
+    pgd_results_A.append({"eps": eps, **r, "drop": drop})
+    print(f"  ε={eps:.2f} → Acc: {r['accuracy']:.2f}% (↓{drop:.2f}%) | F1: {r['f1']:.4f}")
+#+end_src
+
+*** Data Poisoning
+#+begin_src python
+print("\n Data Poisoning (Label Flipping)")
+train_raw = ImageFolder(os.path.join(DATA_DIR, "train"), transform=eval_transform)
+poison_results = []
+
+for pf in POISON_FRACS:
+    n = len(train_raw); n_p = int(n * pf)
+    idx_p = random.sample(range(n), n_p)
+
+    poisoned = copy.copy(train_raw)
+    poisoned.samples = list(train_raw.samples)
+    for i in idx_p:
+        path, orig = poisoned.samples[i]
+        poisoned.samples[i] = (path, random.choice([c for c in range(NUM_CLASSES) if c != orig]))
+    poisoned.targets = [s[1] for s in poisoned.samples]
+
+    p_loader = DataLoader(poisoned, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    p_model = build_model()
+    p_opt = optim.Adam(p_model.parameters(), lr=LR_FROZEN)
+    p_model.train()
+    for _ in range(3):
+        for imgs, lbls in p_loader:
+            imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
+            p_opt.zero_grad(); F.cross_entropy(p_model(imgs), lbls).backward(); p_opt.step()
+    r = evaluate_clean(p_model, test_loader)
+    poison_results.append({"frac": pf, "accuracy": r["accuracy"], "f1": r["f1"]})
+    print(f"  {pf*100:.0f}% empoisonné → Acc: {r['accuracy']:.2f}% | F1: {r['f1']:.4f}")
+    del p_model; torch.cuda.empty_cache() if torch.cuda.is_available() else None
+#+end_src
+
+** Visualization
+#+begin_src python
+baseline.eval()
+s_imgs, s_lbls = next(iter(test_loader))
+s_imgs, s_lbls = s_imgs[:6].to(DEVICE), s_lbls[:6].to(DEVICE)
+
+adv_fgsm = fgsm_attack(baseline, s_imgs, s_lbls, 0.05)
+adv_pgd  = pgd_attack(baseline, s_imgs, s_lbls, 0.05, PGD_ALPHA, PGD_STEPS)
+
+with torch.no_grad():
+    p_clean = baseline(s_imgs).argmax(1)
+    p_fgsm  = baseline(adv_fgsm).argmax(1)
+    p_pgd   = baseline(adv_pgd).argmax(1)
+
+fig, axes = plt.subplots(3, 6, figsize=(22, 11))
+fig.suptitle("Phase B — Exemples adversariaux (ε=0.05)", fontsize=14, fontweight='bold')
+for i in range(6):
+    for row, (tensor, pred, label) in enumerate([
+        (s_imgs[i], p_clean[i], "Original"),
+        (adv_fgsm[i], p_fgsm[i], "FGSM"),
+        (adv_pgd[i], p_pgd[i], "PGD"),
+    ]):
+        axes[row, i].imshow(denorm(tensor.unsqueeze(0)))
+        ok = pred == s_lbls[i]
+        title = f"{CLASS_NAMES[pred]}" if row > 0 else f"True: {CLASS_NAMES[s_lbls[i]]}\nPred: {CLASS_NAMES[pred]}"
+        axes[row, i].set_title(title, fontsize=8, color='green' if ok else 'red')
+        axes[row, i].axis('off')
+for ax, lbl in zip(axes[:, 0], ["Original", "FGSM ε=0.05", "PGD ε=0.05"]):
+    ax.set_ylabel(lbl, fontsize=11, fontweight='bold', rotation=0, labelpad=70, va='center')
+plt.tight_layout()
+plt.show()
+plt.savefig(os.path.join(OUTPUT_DIR, "B_adversarial_examples.png"), dpi=150, bbox_inches='tight')
+#+end_src
+
+** Performance Visualization
+#+begin_src python
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+fig.suptitle("Phase B — Impact des attaques sur le modèle de base", fontsize=14, fontweight='bold')
+
+axes[0].plot(FGSM_EPSILONS, [res_A["accuracy"]]*len(FGSM_EPSILONS), 'b--', lw=1.5, label='Clean')
+axes[0].plot(FGSM_EPSILONS, [r["accuracy"] for r in fgsm_results_A], 'r-s', lw=2, ms=7, label='FGSM')
+axes[0].fill_between(FGSM_EPSILONS, [r["accuracy"] for r in fgsm_results_A],
+                     res_A["accuracy"], alpha=0.15, color='red')
+axes[0].set_title("FGSM", fontweight='bold'); axes[0].set_xlabel("ε")
+axes[0].set_ylabel("Accuracy (%)"); axes[0].legend(); axes[0].grid(alpha=0.3); axes[0].set_ylim(0, 105)
+
+axes[1].plot(PGD_EPSILONS, [res_A["accuracy"]]*len(PGD_EPSILONS), 'b--', lw=1.5, label='Clean')
+axes[1].plot(PGD_EPSILONS, [r["accuracy"] for r in pgd_results_A], 'darkred', marker='D', lw=2, ms=7, label='PGD')
+axes[1].fill_between(PGD_EPSILONS, [r["accuracy"] for r in pgd_results_A],
+                     res_A["accuracy"], alpha=0.15, color='darkred')
+axes[1].set_title("PGD", fontweight='bold'); axes[1].set_xlabel("ε")
+axes[1].set_ylabel("Accuracy (%)"); axes[1].legend(); axes[1].grid(alpha=0.3); axes[1].set_ylim(0, 105)
+
+fracs = [r["frac"]*100 for r in poison_results]
+ax2 = axes[2].twinx()
+axes[2].bar(fracs, [r["accuracy"] for r in poison_results], width=3, color='coral', alpha=0.7)
+ax2.plot(fracs, [r["f1"] for r in poison_results], 'g-^', lw=2, ms=8)
+axes[2].set_title("Data Poisoning", fontweight='bold'); axes[2].set_xlabel("% empoisonné")
+axes[2].set_ylabel("Accuracy (%)", color='coral'); ax2.set_ylabel("F1", color='green')
+axes[2].set_ylim(0, 105); ax2.set_ylim(0, 1.05); axes[2].grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+plt.savefig(os.path.join(OUTPUT_DIR, "B_attack_impact.png"), dpi=150, bbox_inches='tight')
+#+end_src
+
+* Hardening
+** Adversarial PGD Training
+
+#+begin_src  python
+hardened = build_model()
+hardened.load_state_dict(baseline.state_dict())
+criterion_C = nn.CrossEntropyLoss(label_smoothing=0.1)
+opt_C = optim.Adam(hardened.parameters(), lr=LR_FINETUNE, weight_decay=WEIGHT_DECAY)
+sched_C = optim.lr_scheduler.CosineAnnealingLR(opt_C, T_max=EPOCHS_HARDEN)
+
+hist_C = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+best_val_acc_C = 0.0
+
+print(f"\n  Config: ε={ADV_EPSILON}, α={ADV_ALPHA}, steps={ADV_STEPS}, ratio={ADV_RATIO}")
+print(f"  Epochs: {EPOCHS_HARDEN}\n")
+
+for epoch in range(1, EPOCHS_HARDEN + 1):
+    t0 = time.time()
+    hardened.train()
+    rloss, correct, total = 0.0, 0, 0
+    for imgs, lbls in train_loader:
+        imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
+        bs = imgs.size(0); n_adv = int(bs * ADV_RATIO)
+
+        hardened.eval()
+        adv = pgd_attack(hardened, imgs[:n_adv], lbls[:n_adv], ADV_EPSILON, ADV_ALPHA, ADV_STEPS)
+        hardened.train()
+
+        combined = torch.cat([adv, imgs[n_adv:]])
+        combined_lbls = torch.cat([lbls[:n_adv], lbls[n_adv:]])
+
+        opt_C.zero_grad()
+        out = hardened(combined); loss = criterion_C(out, combined_lbls)
+        loss.backward(); opt_C.step()
+        rloss += loss.item() * combined.size(0)
+        correct += out.argmax(1).eq(combined_lbls).sum().item(); total += combined_lbls.size(0)
+    sched_C.step()
+    tl, ta = rloss/total, 100.*correct/total
+
+    res_val = evaluate_clean(hardened, val_loader)
+    vl, va = res_val["loss"], res_val["accuracy"]
+    hist_C["train_loss"].append(tl); hist_C["train_acc"].append(ta)
+    hist_C["val_loss"].append(vl);   hist_C["val_acc"].append(va)
+
+    print(f"  Epoch [{epoch}/{EPOCHS_HARDEN}] "
+          f"Train: {tl:.4f}/{ta:.2f}% | Val: {vl:.4f}/{va:.2f}% | {time.time()-t0:.1f}s")
+    if va > best_val_acc_C:
+        best_val_acc_C = va
+        torch.save(hardened.state_dict(), os.path.join(OUTPUT_DIR, "_best_C.pth"))
+
+hardened.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "_best_C.pth"), weights_only=True))
+#+end_src
+
+** Evaluation
+
+#+begin_src python
+res_C = evaluate_clean(hardened, test_loader)
+print(f"  Accuracy:  {res_C['accuracy']:.2f}%  (base: {res_A['accuracy']:.2f}%)")
+print(f"  F1-Score:  {res_C['f1']:.4f}  (base: {res_A['f1']:.4f})")
+print(f"\n{classification_report(res_C['labels'], res_C['preds'], target_names=CLASS_NAMES)}")
+#+end_src
+
+** Attacks on hardened model
+
+#+begin_src python
+print("\n With FGSM :")
+fgsm_results_C = []
+for eps in FGSM_EPSILONS:
+    r = evaluate_attack(hardened, test_loader, lambda m, x, y, e=eps: fgsm_attack(m, x, y, e))
+    fgsm_results_C.append({"eps": eps, **r})
+    base_r = next(x for x in fgsm_results_A if x["eps"] == eps)
+    print(f"    ε={eps:.2f} → Acc: {r['accuracy']:.2f}%  (base: {base_r['accuracy']:.2f}%, Δ+{r['accuracy']-base_r['accuracy']:.2f}%)")
+
+print("\n With PGD :")
+pgd_results_C = []
+for eps in PGD_EPSILONS:
+    r = evaluate_attack(hardened, test_loader,
+                        lambda m, x, y, e=eps: pgd_attack(m, x, y, e, PGD_ALPHA, PGD_STEPS))
+    pgd_results_C.append({"eps": eps, **r})
+    base_r = next(x for x in pgd_results_A if x["eps"] == eps)
+    print(f"    ε={eps:.2f} → Acc: {r['accuracy']:.2f}%  (base: {base_r['accuracy']:.2f}%, Δ+{r['accuracy']-base_r['accuracy']:.2f}%)")
+#+end_src
+
+** Exportation
+
+#+begin_src python
+save_C = os.path.join(OUTPUT_DIR, "hardened_model.pth")
+torch.save({
+    "model_state_dict": hardened.state_dict(),
+    "architecture": "efficientnet_b0",
+    "num_classes": NUM_CLASSES,
+    "class_names": CLASS_NAMES,
+    "test_acc": res_C["accuracy"],
+    "test_f1": res_C["f1"],
+    "training": "adversarial_pgd",
+    "adv_config": {"epsilon": ADV_EPSILON, "alpha": ADV_ALPHA, "steps": ADV_STEPS, "ratio": ADV_RATIO},
+}, save_C)
+print(f"\n Modèle durci sauvegardé: {save_C}")
+#+end_src
+
+* Results
+** Comparison : Soft Model vs Hard Model
+
+#+begin_src python
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+fig.suptitle("Comparaison : Modèle de Base vs Modèle Durci", fontsize=15, fontweight='bold')
+
+attacks = ([f"FGSM\nε={r['eps']}" for r in fgsm_results_A[:3]]
+         + [f"PGD\nε={r['eps']}" for r in pgd_results_A[:3]])
+base_accs = ([r["accuracy"] for r in fgsm_results_A[:3]]
+           + [r["accuracy"] for r in pgd_results_A[:3]])
+hard_accs = ([r["accuracy"] for r in fgsm_results_C[:3]]
+           + [r["accuracy"] for r in pgd_results_C[:3]])
+
+x = np.arange(len(attacks)); w = 0.35
+b1 = axes[0].bar(x - w/2, base_accs, w, label='Base', color='#ef4444', alpha=0.8)
+b2 = axes[0].bar(x + w/2, hard_accs, w, label='Durci', color='#22c55e', alpha=0.8)
+axes[0].set_xticks(x); axes[0].set_xticklabels(attacks, fontsize=9)
+axes[0].set_ylabel("Accuracy (%)"); axes[0].set_ylim(0, 105)
+axes[0].set_title("Accuracy sous attaque", fontweight='bold')
+axes[0].legend(); axes[0].grid(alpha=0.3, axis='y')
+for bar in b1:
+    axes[0].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.8, f'{bar.get_height():.1f}',
+                 ha='center', fontsize=7)
+for bar in b2:
+    axes[0].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.8, f'{bar.get_height():.1f}',
+                 ha='center', fontsize=7)
+
+gains = [h - b for b, h in zip(base_accs, hard_accs)]
+colors = ['#22c55e' if g > 0 else '#ef4444' for g in gains]
+axes[1].bar(x, gains, 0.6, color=colors, alpha=0.8)
+axes[1].axhline(0, color='black', lw=0.5)
+axes[1].set_xticks(x); axes[1].set_xticklabels(attacks, fontsize=9)
+axes[1].set_ylabel("Δ Accuracy (%)"); axes[1].set_title("Gain de robustesse", fontweight='bold')
+axes[1].grid(alpha=0.3, axis='y')
+for xi, g in zip(x, gains):
+    axes[1].text(xi, g + (1 if g >= 0 else -2), f'{g:+.1f}%', ha='center', fontsize=9, fontweight='bold')
+
+plt.tight_layout()
+plt.show()
+plt.savefig(os.path.join(OUTPUT_DIR, "C_robustness_comparison.png"), dpi=150, bbox_inches='tight')
+#+end_src
+
+** Prediction Test
+#+begin_src python
+if len(my_paths) > 0:
+    print(f"\n Prédictions comparées (base vs durci) sur notre dataset")
+    baseline.eval(); hardened.eval()
+
+    print(f"\n{'#':<4} {'Fichier':<25} {'Base':<22} {'Durci':<22}")
+    print("─" * 75)
+    for i, path in enumerate(my_paths):
+        tensor = eval_transform(Image.open(path).convert("RGB")).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            pb = F.softmax(baseline(tensor), dim=1)[0]
+            ph = F.softmax(hardened(tensor), dim=1)[0]
+        cb, ib = pb.max(0); ch, ih = ph.max(0)
+        print(f" {i+1:<3} {os.path.basename(path):<25} "
+              f"{CLASS_NAMES[ib]} ({cb.item()*100:.1f}%)   "
+              f"{CLASS_NAMES[ih]} ({ch.item()*100:.1f}%)")
+#+end_src
+
+** Hardened Model Metrics
+#+begin_src python
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("Courbes d'entraînement adversarial", fontsize=14, fontweight='bold')
+ep = range(1, len(hist_C["train_loss"])+1)
+axes[0].plot(ep, hist_C["train_loss"], 'o-', color='#22c55e', label='Train', ms=4)
+axes[0].plot(ep, hist_C["val_loss"], 's-', color='orange', label='Val', ms=4)
+axes[0].legend(); axes[0].grid(alpha=0.3); axes[0].set_title("Loss"); axes[0].set_xlabel("Epoch")
+axes[1].plot(ep, hist_C["train_acc"], 'o-', color='#22c55e', label='Train', ms=4)
+axes[1].plot(ep, hist_C["val_acc"], 's-', color='orange', label='Val', ms=4)
+axes[1].legend(); axes[1].grid(alpha=0.3); axes[1].set_title("Accuracy (%)"); axes[1].set_xlabel("Epoch")
+plt.tight_layout()
+plt.show()
+plt.savefig(os.path.join(OUTPUT_DIR, "C_training_curves.png"), dpi=150, bbox_inches='tight')
+#+end_src
