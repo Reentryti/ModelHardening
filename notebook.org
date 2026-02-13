@@ -1,8 +1,152 @@
 #+title: Classification Model Hardening
 
 ** Importations
+#+begin_src python
+# Standard Library
+import os
+import glob
+import json
+import time
+import copy
+import random
+import warnings
+import pickle
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageFilter
+
+# PyTorch & Deep Learning
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms, models
+from torchvision.datasets import ImageFolder
+
+# Metrics & Evaluation
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support
+)
+
+# Visualization
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+
+# Settings
+warnings.filterwarnings('ignore')
+
+print("All modules are well imported and loaded")
+#+end_src
+
 ** Parameters
+#+begin_src python
+SEED         = 42
+IMAGE_SIZE   = 224
+BATCH_SIZE   = 32
+NUM_WORKERS  = 2
+
+# Initial Training parameters
+EPOCHS_BASELINE    = 15
+LR_FROZEN          = 1e-3
+LR_FINETUNE        = 1e-4
+WEIGHT_DECAY       = 1e-4
+
+# Attacks parameters
+FGSM_EPSILONS = [0.01, 0.03, 0.05, 0.1, 0.15]
+PGD_EPSILONS  = [0.01, 0.03, 0.05, 0.1]
+PGD_ALPHA     = 0.007
+PGD_STEPS     = 10
+POISON_FRACS  = [0.05, 0.1, 0.2, 0.3]
+
+# Hardening parameters
+EPOCHS_HARDEN  = 10
+ADV_EPSILON    = 0.03
+ADV_ALPHA      = 0.007
+ADV_STEPS      = 7
+ADV_RATIO      = 0.5
+
+# Path (Kaggle)
+DATA_DIR      = "/kaggle/input/datasets/misrakahmed/vegetable-image-dataset/Vegetable Images"
+MY_IMAGES_DIR = "/kaggle/input/datasets/hacerone/advrsvegetable"
+OUTPUT_DIR    = "/kaggle/working"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+
+print(f"Device: {DEVICE}")
+if torch.cuda.is_available(): print(f"GPU: {torch.cuda.get_device_name(0)}")
+#+end_src
+
 ** Functions
+#+begin_src python
+mean_t = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+std_t  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+denorm = lambda t: (t.cpu().squeeze(0) * std_t + mean_t).clamp(0, 1).permute(1, 2, 0).numpy()
+
+def fgsm_attack(mdl, images, labels, epsilon):
+    inp = images.clone().detach().requires_grad_(True)
+    loss = F.cross_entropy(mdl(inp), labels)
+    mdl.zero_grad(); loss.backward()
+    return (inp + epsilon * inp.grad.sign()).detach()
+
+def pgd_attack(mdl, images, labels, epsilon, alpha, steps):
+    adv = images.clone().detach() + torch.empty_like(images).uniform_(-epsilon, epsilon)
+    for _ in range(steps):
+        adv.requires_grad_(True)
+        loss = F.cross_entropy(mdl(adv), labels)
+        mdl.zero_grad(); loss.backward()
+        adv = (adv.detach() + alpha * adv.grad.sign())
+        adv = images + torch.clamp(adv - images, -epsilon, epsilon)
+    return adv.detach()
+
+def evaluate_clean(mdl, loader):
+    mdl.eval()
+    preds_all, labels_all, loss_sum, total = [], [], 0.0, 0
+    with torch.no_grad():
+        for imgs, lbls in loader:
+            imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
+            out = mdl(imgs)
+            loss_sum += F.cross_entropy(out, lbls, reduction='sum').item()
+            preds_all.extend(out.argmax(1).cpu().numpy())
+            labels_all.extend(lbls.cpu().numpy())
+            total += lbls.size(0)
+    preds_all, labels_all = np.array(preds_all), np.array(labels_all)
+    acc = 100.0 * (preds_all == labels_all).sum() / len(labels_all)
+    prec, rec, f1, _ = precision_recall_fscore_support(labels_all, preds_all, average='weighted')
+    return {"accuracy": acc, "loss": loss_sum/total, "precision": prec,
+            "recall": rec, "f1": f1, "preds": preds_all, "labels": labels_all}
+
+def evaluate_attack(mdl, loader, attack_fn):
+    mdl.eval()
+    correct, total = 0, 0
+    preds_all, labels_all = [], []
+    for imgs, lbls in loader:
+        imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
+        adv = attack_fn(mdl, imgs, lbls)
+        with torch.no_grad():
+            p = mdl(adv).argmax(1)
+        correct += p.eq(lbls).sum().item()
+        total += lbls.size(0)
+        preds_all.extend(p.cpu().numpy()); labels_all.extend(lbls.cpu().numpy())
+    acc = 100.0 * correct / total
+    _, _, f1, _ = precision_recall_fscore_support(labels_all, preds_all, average='weighted', zero_division=0)
+    return {"accuracy": acc, "f1": f1}
+
+def build_model():
+    mdl = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+    in_f = mdl.classifier[1].in_features
+    mdl.classifier = nn.Sequential(
+        nn.Dropout(0.3, inplace=True), nn.Linear(in_f, 256),
+        nn.ReLU(), nn.Dropout(0.2), nn.Linear(256, NUM_CLASSES))
+    return mdl.to(DEVICE)
+#+end_src
+
 * Standard Model
 ** Dataset Preparation
 #+begin_src python
