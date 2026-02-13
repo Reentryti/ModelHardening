@@ -3,7 +3,6 @@ import type { HealthResponse } from "../types/api";
 export function Header({ health }: { health: HealthResponse | null }) {
   const loaded = health ? Object.values(health.models).filter(Boolean).length : 0;
   const total = health ? Object.keys(health.models).length : 0;
-
   return (
     <header className="border-b border-neutral-900 px-6 py-4 flex justify-between items-center">
       <div className="flex items-center gap-3">
@@ -11,7 +10,7 @@ export function Header({ health }: { health: HealthResponse | null }) {
         <div>
           <div className="text-sm font-medium tracking-tight">vegclassify</div>
           <div className="text-[10px] text-neutral-600 tracking-widest">
-            BASE vs DURCI · EFFICIENTNET-B0 · CPU
+            ANALYSE DE ROBUSTESSE ADVERSARIALE · CPU
           </div>
         </div>
       </div>
