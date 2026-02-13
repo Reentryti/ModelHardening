@@ -2,7 +2,9 @@ import argparse
 import io
 import time
 from pathlib import Path
+import base64
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +22,9 @@ CLASS_NAMES = [
     "Cabbage", "Capsicum", "Carrot", "Cauliflower", "Cucumber",
     "Papaya", "Potato", "Pumpkin", "Radish", "Tomato",
 ]
+
+MEAN = torch.tensor([0.485, 0456, 0.406]).view(3, 1, 1)
+STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -43,14 +48,38 @@ def load_model(path: str) -> nn.Module:
     model.eval()
     return model
 
-# Prediction Image
-def predict_image(model: nn.Module, image_bytes: bytes, top_k: int = 5) -> dict:
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    tensor = transform(img).unsqueeze(0)
+# Attacks
+def fgsm_attack(model: nn.Module, tensor: torch.Tensor, label: int, epsilon: float) -> torch.Tensor:
+    inp = tensor.clone().detach().requires_grad_(True)
+    loss = F.cross_entropy(model(inp.unsqueeze(0)), torch.tensor([label]))
+    model.zero_grad()
+    loss.backward()
+    return (tensor + epsilon * inp.grad.sign()).detach()
 
+def pgd_attack(model: nn.Module, tensor: torch.Tensor, label: int, epsilon: float, alpha: float = 0.007, steps: int = 10) -> torch.Tensor:
+    adv = tensor.clone().detach() + torch.empty_like(tensor).uniform_(-epsilon, epsilon)
+    for _ in range(steps):
+        adv.requires_grad_(True)
+        loss = F.cross_entropy(model(adv.unsqueeze(0)), torch.tensor([label]))
+        model.zero_grad()
+        loss.backward()
+        adv = (adv.detach() + alpha * adv.grad.sign())
+        adv = tensor + torch.clamp(adv - tensor, -epsilon, epsilon)
+    return adv.detach()
+
+# Utils
+def tensor_to_base64(tensor: torch.Tensor) -> str:
+    img = (tensor * STD + MEAN).clamp(0, 1)
+    img = transforms.ToPILImage()(img)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+# Prediction Image
+def predict_image(model: nn.Module, tensor: torch.Tensor, top_k: int = 5) -> dict:
     t0 = time.perf_counter()
     with torch.no_grad():
-        logits = model(tensor)
+        logits = model(tensor.unsqueeze(0))
     elapsed = (time.perf_counter() - t0) * 1000
 
     probs = F.softmax(logits, dim=1)[0]
@@ -62,8 +91,12 @@ def predict_image(model: nn.Module, image_bytes: bytes, top_k: int = 5) -> dict:
     ]
     return {"predictions": predictions, "inference_time_ms": round(elapsed, 2)}
 
+def load_image(image_bytes: bytes) -> torch.Tensor:
+    img= Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return transform(img)
+
 # App
-app = FastAPI(title="vegclassify", version="2.0.0")
+app = FastAPI(title="Vegclassify", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 engines: dict[str, nn.Module] = {}
@@ -93,20 +126,79 @@ def get_classes():
 async def predict(file: UploadFile = File(...), model: str = Form("baseline")):
     if model not in engines:
         return {"error": f"Unknown model: {model}. Available: {list(engines.keys())}"}
-    data = await file.read()
+    data = load_image(await file.read())
     result = predict_image(engines[model], data)
     result["model"] = model
     return result
 
 @app.post("/api/compare")
 async def compare(file: UploadFile = File(...)):
-    data = await file.read()
+    data = load_image(await file.read())
     results = {}
     for key, mdl in engines.items():
         results[key] = predict_image(mdl, data)
     return {"results": results}
 
-# ── Static files + SPA fallback ──
+@app.post("/api/robustness")
+async def robustness(
+    file: UploadFile = File(...),
+    fgsm_eps: str = Form("0.03,0.05,0.1"),
+    pgd_eps: str = Form("0.03,0.05,0.1"),
+):
+
+    data = await file.read()
+    tensor = load_image(data)
+
+    fgsm_epsilons = [float(e.strip()) for e in fgsm_eps.split(",") if e.strip()]
+    pgd_epsilons = [float(e.strip()) for e in pgd_eps.split(",") if e.strip()]
+
+    # On a besoin du label prédit par le baseline pour générer les attaques
+    with torch.no_grad():
+        base_logits = engines["baseline"](tensor.unsqueeze(0)) if "baseline" in engines else None
+    target_label = int(base_logits.argmax(1)[0]) if base_logits is not None else 0
+
+    # Clean
+    clean_image_b64 = tensor_to_base64(tensor)
+    clean_preds = {k: predict_image(m, tensor) for k, m in engines.items()}
+
+    # Attaques
+    attack_model = engines.get("baseline", list(engines.values())[0])
+    scenarios = []
+
+    for eps in fgsm_epsilons:
+        adv = fgsm_attack(attack_model, tensor, target_label, eps)
+        adv_b64 = tensor_to_base64(adv)
+        preds = {k: predict_image(m, adv) for k, m in engines.items()}
+        scenarios.append({
+            "attack": "FGSM",
+            "epsilon": eps,
+            "image_b64": adv_b64,
+            "predictions": preds,
+        })
+
+    for eps in pgd_epsilons:
+        adv = pgd_attack(attack_model, tensor, target_label, eps)
+        adv_b64 = tensor_to_base64(adv)
+        preds = {k: predict_image(m, adv) for k, m in engines.items()}
+        scenarios.append({
+            "attack": "PGD",
+            "epsilon": eps,
+            "image_b64": adv_b64,
+            "predictions": preds,
+        })
+
+    return {
+        "clean": {
+            "image_b64": clean_image_b64,
+            "predictions": clean_preds,
+        },
+        "scenarios": scenarios,
+        "true_label": CLASS_NAMES[target_label],
+        "models_used": list(engines.keys()),
+    }
+
+
+# Static files + SPA fallback
 static_dir = Path(__file__).parent / "static"
 
 def mount_static():
@@ -120,7 +212,7 @@ def mount_static():
                 return FileResponse(file_path)
             return FileResponse(static_dir / "index.html")
 
-# ── Entrypoint ──
+# Entrypoint
 def main():
     parser = argparse.ArgumentParser(description="vegclassify CPU server")
     parser.add_argument("--baseline", type=str, help="Baseline model .pth (Phase A)")
