@@ -436,6 +436,16 @@ for pf in POISON_FRACS:
     del p_model; torch.cuda.empty_cache() if torch.cuda.is_available() else None
 #+end_src
 
+| Poisoning degree | Accuracy | F1 Score |
+|------------------+----------+----------|
+|               5% |    99.60 |   0.9960 |
+|------------------+----------+----------|
+|              10% |    99.60 |          |
+|------------------+----------+----------|
+|              20% |    99.33 |          |
+|------------------+----------+----------|
+| 30%              | 98.70    |          |
+
 ** Visualization (adversarial examples data)
 #+begin_src python
 baseline.eval()
